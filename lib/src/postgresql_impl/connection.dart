@@ -398,6 +398,10 @@ class ConnectionImpl implements Connection {
       case _MSG_DATA_ROW:         _readDataRow(msgType, length); break;
       case _MSG_EMPTY_QUERY_REPONSE: assert(length == 0); break;
       case _MSG_COMMAND_COMPLETE: _readCommandComplete(msgType, length); break;
+      case _MSG_COPY_IN_RESPONSE: _readCopyInResponse(msgType, length); break;
+      case _MSG_COPY_OUT_RESPONSE: _readCopyOutResponse(msgType, length); break;
+      case _MSG_COPY_DATA: _readCopyData(msgType, length); break;
+      case _MSG_COPY_DONE: _readCopyDone(msgType, length); break;
 
       default:
         throw new PostgresqlException('Unknown, or unimplemented message: '
@@ -494,6 +498,105 @@ class ConnectionImpl implements Connection {
     } on Exception catch (ex, st) {
       return new Future.error(ex, st);
     }
+  }
+
+  _setColumnsFromTypeMap(_Query query, Map<String, Type> typeMap) {
+    int i=0;
+    query._columns = typeMap.keys.map((k) {
+      return new _Column(i++, k, 0, 0, const {
+        null: _PG_TEXT,
+        String: _PG_TEXT,
+        DateTime: _PG_TIMESTAMP,
+        int: _PG_INT8,
+        double: _PG_FLOAT8,
+        num: _PG_FLOAT8,
+        bool: _PG_BOOL,
+        Object: _PG_JSON,
+        Map: _PG_JSON,
+        List: _PG_JSON
+      }[typeMap[k]], 0, 0, 0);
+    }).toList();
+    query.addRowDescription();
+
+  }
+  Stream<Row> copyOut(String tableOrSql,
+      {/*Map<String,Type> or Iterable<String>*/ columns}) async* {
+
+    var names = "";
+    if (columns!=null) {
+      if (columns is Iterable) columns = new LinkedHashMap.fromIterable(columns, value: (_)=>null);
+      names = "(${(columns is Iterable ? columns : columns.keys).join(", ")})";
+    }
+    var query = _enqueueQuery("COPY $tableOrSql $names TO STDOUT WITH");
+    if (columns is Map) {
+      _setColumnsFromTypeMap(query, columns);
+    }
+
+    await query.readyToCopy;
+
+
+    yield* query.stream;
+  }
+
+  Future<int> copyIn(String table, /*Iterable or Stream*/ data,
+      {/*Map<String,Type> or Iterable<String>*/ columns}) async {
+    try {
+      var names = "";
+      if (columns!=null) {
+        names = "(${(columns is Iterable ? columns : columns.keys).join(", ")})";
+      }
+      var query = _enqueueQuery("COPY $table $names FROM STDIN WITH");
+
+      await query.readyToCopy;
+
+      if (data is Iterable) data = new Stream.fromIterable(data);
+      await for (var rows in data) {
+        var msg = new MessageBuffer();
+        msg.addByte(_MSG_COPY_DATA);
+        msg.addInt32(0); // Length padding.
+
+        String escapeString(String v) {
+          return v
+              .replaceAll("\\N",r"\\N")
+              .replaceAll("\t",r"\t")
+              .replaceAll("\r",r"\r")
+              .replaceAll("\n",r"\n");
+        }
+
+        var isFirst = true;
+        for (var field in rows) {
+          if (!isFirst) {
+            msg.addUtf8String("\t", endWithByte: null);
+          }
+          isFirst = false;
+          if (field==null) {
+            msg.addUtf8String(r"\N", endWithByte: null);
+          } else if (field is String) {
+            msg.addUtf8String(escapeString(field), endWithByte: null);
+          } else if (field is List || field is Map) {
+            msg.addUtf8String(escapeString(JSON.encode(field)), endWithByte: null);
+          } else if (field is DateTime) {
+            msg.addUtf8String(field.toIso8601String(), endWithByte: null);
+          } else {
+            msg.addUtf8String("$field", endWithByte: null);
+          }
+        }
+        msg.addUtf8String("\n", endWithByte: null);
+        msg.setLength();
+        _socket.add(msg.buffer);
+      }
+
+      var msg = new MessageBuffer();
+      msg.addByte(_MSG_COPY_DONE);
+      msg.addInt32(0); // Length padding.
+      msg.setLength();
+      _socket.add(msg.buffer);
+
+      return query.stream.isEmpty.then((_) => query._rowsAffected);
+    } on Exception catch (ex, st) {
+      return new Future.error(ex, st);
+    }
+
   }
 
   Future runInTransaction(Future operation(), [Isolation isolation = readCommitted]) {
@@ -639,6 +742,85 @@ class ConnectionImpl implements Connection {
 
     _query._commandIndex++;
     _query._rowsAffected = rowsAffected;
+  }
+
+  void _readCopyOutResponse(int msgType, int length) {
+    assert(_buffer.bytesAvailable >= length);
+
+    var format = _buffer.readByte();
+    var ncolumns = _buffer.readInt16();
+
+    var columnFormats = new List.generate(ncolumns, (_)=>_buffer.readInt16());
+
+    _query._readyToCopyCompleter.complete();
+  }
+
+  void _readCopyData(int msgType, int length) {
+    assert(_buffer.bytesAvailable >= length);
+
+    String v = _buffer.readUtf8StringN(length);
+
+    String unescapeString(String v) {
+      return v
+          .replaceAll(r"\\N","\\N")
+          .replaceAll(r"\t","\t")
+          .replaceAll(r"\r","\r")
+          .replaceAll(r"\b","\b")
+          .replaceAll(r"\v","\v")
+          .replaceAll(r"\f","\f")
+          .replaceAll(r"\n","\n");
+    }
+
+    parseField(String v, int type) {
+      if (v==r"\N") return null;
+      v = unescapeString(v);
+      switch (type) {
+        case _PG_JSON:
+          return JSON.decode(v);
+        case _PG_BOOL:
+          return v=="t";
+        case _PG_INT8:
+          return int.parse(v);
+        case _PG_FLOAT8:
+          return double.parse(v);
+        case _PG_TIMESTAMP:
+          return DateTime.parse(v);
+        case _PG_TEXT:
+        default:
+          return v;
+      }
+    }
+    for (var row in v.split("\n")) {
+      if (row.isEmpty) continue;
+
+      var fields = row.split("\t");
+      if (_query._columns==null) {
+        _setColumnsFromTypeMap(_query,
+            new Map.fromIterable(new Iterable.generate(fields.length), key: (i)=>"column$i", value: (_)=>null));
+      }
+
+      var data = [];
+      for (var c in row.split("\t")) {
+        data.add(parseField(c, _query._columns[data.length].fieldType));
+      }
+      _query._rowData = data;
+      _query.addRow();
+    }
+  }
+
+  void _readCopyDone(int msgType, int length) {
+    assert(_buffer.bytesAvailable >= length);
+  }
+
+  void _readCopyInResponse(int msgType, int length) {
+    assert(_buffer.bytesAvailable >= length);
+
+    var format = _buffer.readByte();
+    var ncolumns = _buffer.readInt16();
+
+    var columnFormats = new List.generate(ncolumns, (_)=>_buffer.readInt16());
+
+    _query._readyToCopyCompleter.complete();
   }
 
   void close() {

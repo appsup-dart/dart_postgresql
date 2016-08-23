@@ -143,10 +143,10 @@ class MessageBuffer {
     _buffer.add(d);
   }
 
-  void addUtf8String(String s) {
+  void addUtf8String(String s, {int endWithByte: 0}) {
     //Postgresql server must be configured to accept UTF8 - this is the default.
     _buffer.addAll(UTF8.encode(s));
-    addByte(0);
+    if (endWithByte!=null) addByte(endWithByte);
   }
 
   void setLength({bool startup: false}) {

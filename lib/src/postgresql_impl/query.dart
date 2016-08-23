@@ -4,6 +4,8 @@ class _Query {
   int _state = _QUEUED;
   final String sql;
   final StreamController<_Row> _controller = new StreamController<_Row>();
+  final Completer _readyToCopyCompleter = new Completer();
+
   int _commandIndex = 0;
   int _columnCount;
   List<_Column> _columns;
@@ -16,6 +18,7 @@ class _Query {
   _Query(this.sql);
 
   Stream<dynamic> get stream => _controller.stream;
+  Future get readyToCopy => _readyToCopyCompleter.future;
 
   void addRowDescription() {
     if (_state == _QUEUED)

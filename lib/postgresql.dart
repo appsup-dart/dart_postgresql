@@ -93,6 +93,11 @@ abstract class Connection {
   /// information returned.
   Future<int> execute(String sql, [values]);
 
+  Future<int> copyIn(String table, /*Iterable or Stream*/ data,
+      {/*Map<String,Type> or Iterable<String>*/ columns});
+
+  Stream<Row> copyOut(String tableOrSql,
+      {/*Map<String,Type> or Iterable<String>*/ columns});
 
   /// Allow multiple queries to be run in a transaction. The user must wait for
   /// runInTransaction() to complete before making any further queries.
