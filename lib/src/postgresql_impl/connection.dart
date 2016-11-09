@@ -557,7 +557,7 @@ class ConnectionImpl implements Connection {
 
         String escapeString(String v) {
           return v
-              .replaceAll("\\N",r"\\N")
+              .replaceAll(r"\",r"\\")
               .replaceAll("\t",r"\t")
               .replaceAll("\r",r"\r")
               .replaceAll("\n",r"\n");
@@ -762,7 +762,7 @@ class ConnectionImpl implements Connection {
 
     String unescapeString(String v) {
       return v
-          .replaceAll(r"\\N","\\N")
+          .replaceAll(r"\\","\\")
           .replaceAll(r"\t","\t")
           .replaceAll(r"\r","\r")
           .replaceAll(r"\b","\b")
